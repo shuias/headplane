@@ -45,7 +45,7 @@ Headscale 是 Tailscale 的社区自托管实现，基于 WireGuard 组网。它
 | dex        | `headplane-dex`       | `ghcr.io/dexidp/dex:v2.41.1`      | 内部 `5556`        | 为 Headplane 与 Headscale 签发令牌 |
 | headscale  | `headscale`           | `headscale/headscale:0.29.3`      | 内部 `8080`        | 控制服务器                        |
 | headplane  | `headplane`           | `ghcr.io/tale/headplane:latest`   | 内部 `3000`        | Web 界面，挂载在 `/admin`         |
-| nginx-auth | `headplane-nginx-auth`| `nginx:1.27-alpine`               | 无                 | 可选的 Basic Auth 边车，默认停用   |
+| nginx-auth | `headplane-nginx-auth`| `nginx:1.27-alpine`               | 无                 | 可选 Basic Auth 边车，用 `--profile basic-auth` 启用 |
 
 `8082` 端口上的分流规则：
 
@@ -162,6 +162,34 @@ docker inspect headplane --format '{{.State.Health.Status}}'
 需要备份 `dex-data/`、`headplane-data/`、`.cache/headscale/` 与 `secrets/`。
 轮换密钥时，写入新值（文件或 `.env`）后重建相关服务；`cookie_secret` 变化会让
 现有会话全部失效。
+
+### 自动化任务
+
+两个 cron 任务负责保持代码同步与服务可用，日志统一写入 `logs/`。
+
+| 时间 | 脚本 | 作用 | 日志 |
+| ---- | ---- | ---- | ---- |
+| 每日 05:00 | `scripts/daily-sync.sh` | 合并 `upstream/main`、推送 fork、拉取镜像并重启 | `logs/daily-sync.log` |
+| 每 5 分钟 | `scripts/watchdog.sh` | 拉起未运行的容器，重启不健康或入口无响应的服务 | `logs/watchdog.log` |
+
+`daily-sync.sh` 在上游没有新提交时直接退出，不做任何重启。有更新时依次执行合并、
+推送 `main` 到 `origin`、`docker compose pull` 与 `docker compose up -d`。合并冲突
+会被中止并记录，工作区不会停留在半合并状态；推送失败只记录日志，不阻断重启。
+
+`watchdog.sh` 会拉起任何未运行的容器，在 Headplane 健康检查为 `unhealthy` 时重启
+面板，并在 `/.well-known/openid-configuration` 或 `/admin/login` 不再返回 200 时重启
+Headplane 与 Dex。启动后 180 秒内不探测，避免把正在启动的服务误判为故障。
+
+计划内维护时可暂停看门狗：
+
+```sh
+touch logs/.maintenance      # 暂停
+rm logs/.maintenance         # 恢复
+```
+
+开机自启由四个服务的 `restart: unless-stopped` 与 Docker 守护进程的开机启用共同
+保证；用 `docker compose down` 显式停掉的栈不会自动回来，等待下次看门狗执行时启动。
+调整或删除任务使用 `crontab -e`。
 
 ### 故障排查
 

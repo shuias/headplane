@@ -78,6 +78,10 @@ services:
     image: "nginx:1.27-alpine"
     container_name: "headplane-nginx-auth"
     restart: "no"
+    # Disabled by default so `docker compose up -d` (including the watchdog)
+    # never starts it. Run `docker compose --profile basic-auth up -d` to use it.
+    profiles:
+      - "basic-auth"
     depends_on:
       - "headplane"
     networks:

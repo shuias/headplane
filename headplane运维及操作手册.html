@@ -459,7 +459,7 @@
       Headscale 控制面与 Headplane 面板的架构、部署、配置、密钥、巡检与故障处置。
     </p>
     <dl class="meta-grid">
-      <div><dt>文档版本</dt><dd>1.0</dd></div>
+      <div><dt>文档版本</dt><dd>1.1</dd></div>
       <div><dt>更新日期</dt><dd>2026-11-10</dd></div>
       <div><dt>适用范围</dt><dd>本仓库 compose.yaml</dd></div>
       <div><dt>Headplane</dt><dd>0.8.1</dd></div>
@@ -475,9 +475,10 @@
       <li><a href="#deploy"><span class="num">02</span>部署与首次启动</a></li>
       <li><a href="#config"><span class="num">03</span>配置与密钥管理</a></li>
       <li><a href="#ops"><span class="num">04</span>日常运维</a></li>
-      <li><a href="#troubleshoot"><span class="num">05</span>故障排查</a></li>
-      <li><a href="#upgrade"><span class="num">06</span>升级、回滚与上游同步</a></li>
-      <li><a href="#appendix"><span class="num">07</span>附录：速查表</a></li>
+      <li><a href="#automation"><span class="num">05</span>自动化运维</a></li>
+      <li><a href="#troubleshoot"><span class="num">06</span>故障排查</a></li>
+      <li><a href="#upgrade"><span class="num">07</span>升级、回滚与上游同步</a></li>
+      <li><a href="#appendix"><span class="num">08</span>附录：速查表</a></li>
     </ol>
   </nav>
 
@@ -792,7 +793,93 @@ docker compose up -d</code></pre>
     <pre><code>python3 -c "import bcrypt; print(bcrypt.hashpw(b'new-password', bcrypt.gensalt(10)).decode())"</code></pre>
 
     <!-- ==================== 05 ==================== -->
-    <h2 id="troubleshoot">05 · 故障排查</h2>
+    <h2 id="automation">05 · 自动化运维</h2>
+
+    <p>
+      两个 cron 任务分别负责「跟随上游」与「保持可用」：每日同步只在有更新时动作，
+      看门狗每 5 分钟巡检一次。脚本均入库，日志写入 <code>logs/</code>（已被 Git 忽略）。
+    </p>
+
+    <h3>任务一览</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>脚本</th><th>作用</th><th>日志</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>每日 05:00</td>
+            <td><code>scripts/daily-sync.sh</code></td>
+            <td>合并 upstream、推送 fork、拉取镜像并重启服务</td>
+            <td><code>logs/daily-sync.log</code></td>
+          </tr>
+          <tr>
+            <td>每 5 分钟</td>
+            <td><code>scripts/watchdog.sh</code></td>
+            <td>拉起未运行容器，重启不健康或无响应的服务</td>
+            <td><code>logs/watchdog.log</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="code-label">crontab</div>
+    <pre><code>0 5 * * * /home/shuias/git/headplane/scripts/daily-sync.sh
+*/5 * * * * /home/shuias/git/headplane/scripts/watchdog.sh</code></pre>
+
+    <h3>每日同步</h3>
+    <p>脚本先 <code>git fetch upstream</code>，再判断 <code>upstream/main</code> 是否已是 <code>main</code> 的祖先。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>判断结果</th><th>动作</th></tr></thead>
+        <tbody>
+          <tr><td>无新提交</td><td>记录一行日志后退出，<strong>不重启任何服务</strong></td></tr>
+          <tr><td>有新提交</td><td>合并 → 推送 <code>main</code> 到 <code>origin</code> → <code>docker compose pull</code> → <code>docker compose up -d</code></td></tr>
+          <tr><td>合并冲突</td><td>执行 <code>git merge --abort</code> 回滚，记录日志，等待人工处理</td></tr>
+          <tr><td>推送失败</td><td>记录日志，本地合并保留，仍继续重启服务</td></tr>
+          <tr><td>重启后异常</td><td>等待 15 秒后检查不健康容器并写入日志</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout warn">
+      <span class="label">注意</span>
+      <p>
+        合并冲突时脚本不会强制解决，也不会留下半合并的工作区。人工处理完冲突并推送后，
+        下一次 05:00 会正常继续；如需立即生效，手动执行一次脚本即可。
+      </p>
+    </div>
+
+    <h3>看门狗</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>触发条件</th><th>动作</th></tr></thead>
+        <tbody>
+          <tr><td>四个容器中任一不在运行</td><td>执行 <code>docker compose up -d</code> 补齐（不重建已运行容器）</td></tr>
+          <tr><td>Headplane 健康检查为 <code>unhealthy</code></td><td>重启 <code>headplane</code></td></tr>
+          <tr><td>发现文档或登录页不返回 <code>200</code></td><td>重启 <code>headplane</code> 与 <code>headplane-dex</code></td></tr>
+          <tr><td>容器启动不足 180 秒</td><td>跳过本轮探测，避免误判正在启动的服务</td></tr>
+          <tr><td>存在 <code>logs/.maintenance</code></td><td>跳过本轮，用于计划内停机</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>开机自启</h3>
+    <ul>
+      <li><code>docker.service</code> 已 <code>enabled</code> 且 <code>active</code>，宿主机重启后守护进程自动拉起。</li>
+      <li>四个服务均为 <code>restart: unless-stopped</code>，守护进程启动后自动恢复。</li>
+      <li>用 <code>docker compose down</code> 显式停掉的栈不会自动恢复，最多 5 分钟后由看门狗拉起。</li>
+      <li><code>nginx-auth</code> 使用 <code>profiles: ["basic-auth"]</code>，常规 <code>up</code> 与看门狗都不会启动它。</li>
+    </ul>
+
+    <h3>维护模式与调整</h3>
+    <div class="code-label">暂停与恢复</div>
+    <pre><code>mkdir -p logs
+touch logs/.maintenance      # 暂停看门狗，人工停机不会被拉起
+rm logs/.maintenance         # 恢复巡检
+
+crontab -e                   # 调整或删除任务
+tail -f logs/watchdog.log    # 观察巡检记录
+tail -f logs/daily-sync.log  # 观察同步记录</code></pre>
+
+    <!-- ==================== 06 ==================== -->
+    <h2 id="troubleshoot">06 · 故障排查</h2>
 
     <h3>症状对照表</h3>
     <div class="table-wrap">
@@ -861,8 +948,8 @@ docker compose up -d</code></pre>
       </p>
     </div>
 
-    <!-- ==================== 06 ==================== -->
-    <h2 id="upgrade">06 · 升级、回滚与上游同步</h2>
+    <!-- ==================== 07 ==================== -->
+    <h2 id="upgrade">07 · 升级、回滚与上游同步</h2>
 
     <h3>升级镜像</h3>
     <pre><code>docker compose pull
@@ -899,8 +986,8 @@ pnpm run typecheck</code></pre>
       </p>
     </div>
 
-    <!-- ==================== 07 ==================== -->
-    <h2 id="appendix">07 · 附录：速查表</h2>
+    <!-- ==================== 08 ==================== -->
+    <h2 id="appendix">08 · 附录：速查表</h2>
 
     <h3>命令速查</h3>
     <div class="table-wrap">

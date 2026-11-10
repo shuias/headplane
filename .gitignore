@@ -21,4 +21,5 @@ node_modules
 /secrets/
 /dex-data/
 /headplane-data/
+/logs/
 /traefik/users.htpasswd

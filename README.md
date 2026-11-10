@@ -50,7 +50,7 @@ OIDC sign-in and the Headplane ↔ Headscale integration on a single machine.
 | dex        | `headplane-dex`     | `ghcr.io/dexidp/dex:v2.41.1`     | internal `5556`        | OIDC issuer for Headplane and Headscale          |
 | headscale  | `headscale`         | `headscale/headscale:0.29.3`     | internal `8080`        | Tailnet control server                           |
 | headplane  | `headplane`         | `ghcr.io/tale/headplane:latest`  | internal `3000`        | Web UI, served under `/admin`                    |
-| nginx-auth | `headplane-nginx-auth` | `nginx:1.27-alpine`           | none                   | Optional Basic Auth sidecar, disabled by default |
+| nginx-auth | `headplane-nginx-auth` | `nginx:1.27-alpine`           | none                   | Optional Basic Auth sidecar, opt-in via `--profile basic-auth` |
 
 Path routing on port `8082`:
 
@@ -173,6 +173,41 @@ Back up `dex-data/`, `headplane-data/`, `.cache/headscale/` and `secrets/`.
 Rotating a secret means writing the new value to its file (or `.env`) and
 recreating the affected services; existing sessions are invalidated when
 `cookie_secret` changes.
+
+### Automation
+
+Two cron jobs keep the stack current and available. Both write to `logs/`.
+
+| Schedule | Script                | Job                                                        | Log                       |
+| -------- | --------------------- | ---------------------------------------------------------- | ------------------------- |
+| 05:00 daily | `scripts/daily-sync.sh` | Merge `upstream/main`, push the fork, pull images, restart | `logs/daily-sync.log`     |
+| every 5 min | `scripts/watchdog.sh`   | Start missing containers, restart unhealthy ones            | `logs/watchdog.log`       |
+
+`daily-sync.sh` exits without touching anything when upstream has no new
+commits. When it does, it merges, pushes `main` to `origin`, then runs
+`docker compose pull` and `docker compose up -d`. A merge that conflicts is
+aborted and logged for manual handling, so the working tree is never left
+half-merged. A failed push is logged but does not block the restart.
+
+`watchdog.sh` starts any container that is not running, restarts Headplane
+when its health check reports `unhealthy`, and restarts Headplane and Dex when
+either `/.well-known/openid-configuration` or `/admin/login` stops returning
+200. It waits 180 seconds after startup before probing, so a booting stack is
+not mistaken for a broken one.
+
+Pause the watchdog during planned maintenance with:
+
+```sh
+touch logs/.maintenance      # pause
+rm logs/.maintenance         # resume
+```
+
+Boot behaviour comes from `restart: unless-stopped` on all four services plus
+the Docker daemon being enabled, so the stack returns after a reboot. A stack
+that was stopped explicitly with `docker compose down` stays down until the
+next watchdog run.
+
+Adjust or remove the jobs with `crontab -e`.
 
 ### Troubleshooting
 
