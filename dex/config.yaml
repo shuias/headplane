@@ -1,0 +1,102 @@
+# Dex (CNCF OIDC provider) — local PoC for validating Headplane ↔ Headscale
+# OIDC automatic user association.
+#
+# CRITICAL RULES (see Experience 468226):
+#   1. issuer must equal the browser-visible origin — no path, no trailing slash,
+#      port included if non-80/443. It is replicated verbatim in Headplane's
+#      `oidc.issuer` and Headscale's `oidc.issuer`.
+#   2. Every redirect URI in `staticClients.redirectURIs` must match what the
+#      client side generates, character for character (path + port included).
+
+issuer: http://dex.local:8082
+
+# Dex requires this flag to accept staticPasswords at startup.
+enablePasswordDB: true
+
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
+
+web:
+  http: 0.0.0.0:5556
+  # No HTTPS — Traefik terminates on port 8082 for us.
+
+frontend:
+  issuer: Headplane-Local-Dex
+  dir: /srv/dex/web
+  # Shows a branded login page for the "emailPassword" connector below.
+
+# Two static clients: one for Headplane (the panel) and one for Headscale (the
+# tailnet control plane). When *both* clients use the same user account, the
+# OIDC `sub` claim matches on both sides, which is exactly what Headplane's
+# `findHeadscaleUserBySubject` uses for automatic user association.
+staticClients:
+  - id: headplane-client
+    # Secrets come from the environment so none are committed; see .env.example.
+    secretEnv: DEX_HEADPLANE_CLIENT_SECRET
+    name: Headplane
+    # EXACT redirect_uri formula from Headplane's provider.ts L309:
+    #   new URL(`${__PREFIX__}/oidc/callback`, config.baseUrl).href
+    # __PREFIX__ = /admin, baseUrl = http://dex.local:8082
+    redirectURIs:
+      - http://dex.local:8082/admin/oidc/callback
+      # Extra: keep a prefixed OIDC-style path variant in case we later switch
+      # the panel to HTTP mode vs. React Router prefix mode. Harmless to list.
+
+  - id: headscale-client
+    secretEnv: DEX_HEADSCALE_CLIENT_SECRET
+    name: Headscale
+    # Headscale's OIDC callback path is hard-coded as `<public_base_url>/oidc/callback`.
+    # We set `public_base_url: http://dex.local:8082` in headscale/config.yaml.
+    redirectURIs:
+      - http://dex.local:8082/oidc/callback
+
+# Connectors — intentionally empty. We authenticate users via staticPasswords
+# (emailPassword flow) which does not need any connector entry at all.
+# If we later want LDAP / GitHub / Google, uncomment and configure below.
+# connectors:
+#   - type: mockCallback
+#     id: mock
+#     name: Mock
+#   - type: ldap
+#     id: ldap
+#     name: LDAP
+#     host: your.ldap.host:636
+#     bindDN: "cn=admin,dc=example,dc=org"
+#     bindPW: "change-me"
+
+# Local accounts stored directly in Dex (bcrypt passwords, same format as
+# .htpasswd bcrypt entries). The `userID` field is the OIDC `sub` value
+# returned in the id_token — this is the exact string that Headplane writes
+# to users.sub and Headscale stores as the last path segment of
+# `users.providerId`.  For automatic association to work, this value MUST
+# be the same when the user signs in via the headscale-client and the
+# headplane-client (which it naturally is when we share a single Dex user).
+staticPasswords:
+  - email: alice@example.com
+    # bcrypt hash from DEX_ALICE_PASSWORD_HASH (see .env.example). Generate with:
+    #   python3 -c "import bcrypt; print(bcrypt.hashpw(b'secret123', bcrypt.gensalt(10)).decode())"
+    hashFromEnv: DEX_ALICE_PASSWORD_HASH
+    username: "Alice Smith"
+    userID: "alice-12345"
+
+  - email: bob@example.com
+    hashFromEnv: DEX_BOB_PASSWORD_HASH
+    username: "Bob Jones"
+    userID: "bob-67890"
+
+# Dex by default only trusts HTTPS for issuer discovery. Because our setup is
+# pure HTTP on localhost, we *must* enable this flag, otherwise Headscale's
+# OIDC client (which uses the secure-only oidc discovery helper by default)
+# will refuse to pull .well-known/openid-configuration over HTTP.
+# This option is Dex-specific (and dangerous on a public network).
+#
+# NOTE: this key only exists in Dex >= v2.40.0 as an undocumented escape hatch.
+# If it fails to parse we fall back to letting the headscale client accept
+# HTTP via its own `insecure_skip_verify_in_transport = true` (set below in
+# headscale/config.yaml).
+# oauth2:
+#   alwaysShowLoginScreen: false
+#   skipApprovalScreen: true
+#   responseTypes: [ "code" ]

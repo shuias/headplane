@@ -1,0 +1,106 @@
+server:
+  host: "0.0.0.0"
+  port: 3000
+  # ---------------------------------------------------------------------------
+  # OIDC rule #1 (Experience 468226):
+  #   base_url must match the browser-visible origin verbatim, including port
+  #   when non-standard. This feeds cookie attributes, redirect_uri assembly,
+  #   and absolute-link generation. NO trailing slash, NO path component.
+  # ---------------------------------------------------------------------------
+  base_url: "http://dex.local:8082"
+  # Secrets are read from files so nothing sensitive is committed to Git.
+  # Create them with `./scripts/bootstrap-secrets.sh` (see README).
+  cookie_secret_path: "/run/secrets/headplane_cookie_secret"
+  # ---------------------------------------------------------------------------
+  # OIDC rule #2:
+  #   cookie_secure must match the PROTOCOL SEEN BY THE BROWSER. We terminate
+  #   HTTP on port 8082, so this must be false. Setting it to true would make
+  #   the browser drop the Set-Cookie after the callback, producing the
+  #   classic 302-loop back to /login.
+  # ---------------------------------------------------------------------------
+  cookie_secure: false
+  data_path: "/var/lib/headplane"
+
+  # Disabled for the OIDC PoC (we want native OIDC login on /admin/login).
+  # Flip back to enabled: true when you want BasicAuth in front.
+  proxy_auth:
+    enabled: false
+    user_header: "Remote-User"
+    name_header: "Remote-Name"
+    allowed_cidrs:
+      - "127.0.0.1/32"
+      - "172.16.0.0/12"
+      - "10.0.0.0/8"
+      - "192.168.0.0/16"
+
+# -----------------------------------------------------------------------------
+# OpenID Connect — the native, fully-supported authentication path used by
+# Headplane for real deployments. Together with headscale OIDC (same issuer)
+# this demonstrates the "automatic user association" flow end-to-end.
+#
+# Callback URL pre-registered in dex/config.yaml → headplane-client:
+#     http://dex.local:8082/admin/oidc/callback
+# Formula used by Headplane at runtime (app/server/oidc/provider.ts L309):
+#     new URL(`${__PREFIX__}/oidc/callback`, config.baseUrl).href
+# -----------------------------------------------------------------------------
+oidc:
+  enabled: true
+  # OIDC rule #3: issuer must match Dex's declared issuer character for char.
+  # Value here must == the `issuer:` key in dex/config.yaml.
+  issuer: "http://dex.local:8082"
+  client_id: "headplane-client"
+  client_secret_path: "/run/secrets/headplane_oidc_client_secret"
+
+  # openid + profile + email is the minimum useful set for Headplane.
+  scope: "openid email profile"
+
+  # Dex 2.x supports PKCE (RFC 7636); turn it on for defense-in-depth even
+  # though our secret is pre-shared. If you swap Dex for Google/GitHub later,
+  # leave it on — they accept it.
+  use_pkce: true
+
+  # What claim(s) should we treat as the canonical OIDC subject when the
+  # `sub` claim is unstable (e.g. Feishu/Lark)? Unused for Dex/Keycloak.
+  # subject_claims: ["sub", "email"]
+
+  # First OIDC sign-in always becomes Owner (findOrCreateUser count==1
+  # upgrade). Subsequent OIDC sign-ins get this default role; owners can
+  # promote users from the Users page.
+  default_role: "member"
+
+  # Optional: sync RBAC role from an IdP-side claim. Leave unset so that we
+  # validate automatic role=Owner via the standard "first user = Owner" rule
+  # (that's what this PoC is proving). To use, declare:
+  #   role_claim: "headplane_role"
+  # and in Dex / your IdP make the claim return one of:
+  #   owner | admin | network_admin | auditor | viewer | member
+  # role_claim: "headplane_role"
+
+  # RP-initiated logout — disabled so we don't have to pre-register a
+  # post_logout_redirect_uri in Dex. Set to true once you've done that.
+  use_end_session: false
+
+headscale:
+  url: "http://headscale:8080"
+  config_path: "/etc/headscale/config.yaml"
+  # ---------------------------------------------------------------------------
+  # OIDC automatic association REQUIRES THIS KEY. After the OIDC callback,
+  # Headplane calls api.users.list() on Headscale (authenticated with this
+  # API key), then runs findHeadscaleUserBySubject(users, sub, email) and
+  # writes the match into headscale_user_id.
+  # ---------------------------------------------------------------------------
+  api_key_path: "/run/secrets/headplane_headscale_api_key"
+
+integration:
+  agent:
+    enabled: false
+  docker:
+    enabled: true
+    container_label: "me.tale.headplane.target=headscale"
+    socket: "unix:///var/run/docker.sock"
+  kubernetes:
+    enabled: false
+    validate_manifest: true
+    pod_name: "headplane"
+  proc:
+    enabled: false

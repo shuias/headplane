@@ -1,42 +1,156 @@
-# THIS IS A DEVELOPER CONFIGURATION FILE
-# IT IS NOT AN EXAMPLE OF SOMETHING YOU DEPLOY
-# I ONLY USE IT FOR DEVELOPING HEADPLANE
-
 networks:
   headplane-dev:
     name: "headplane-dev"
     driver: "bridge"
+
 services:
-  caddy:
-    image: "caddy:2"
-    container_name: "headplane-caddy"
+  traefik:
+    image: "traefik:v3.2"
+    container_name: "headplane-traefik"
     restart: "unless-stopped"
-    depends_on:
-      - "headscale"
     networks:
       - "headplane-dev"
     ports:
-      - "80:80"
-      - "443:443"
+      - "8082:80"       # Browser entry for *everything*: Headplane, Headscale, Dex
+      - "8081:8080"     # Traefik dashboard (http://localhost:8081/)
     volumes:
-      - "./Caddyfile:/etc/caddy/Caddyfile"
-      - "./test/caddy/data:/data"
-      - "./test/caddy/config:/config"
-      - "./test/caddy/certs:/certs"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=headplane-dev"
+      - "--entrypoints.web.address=:80"
+      - "--api.insecure=true"
+      - "--api.dashboard=true"
+      - "--log.level=INFO"
+      # More specific rules win in Traefik v3. Adding these middlewares is
+      # optional, but helps debugging OIDC — you can see X-Forwarded-*
+      # headers on the upstream side via container logs.
+      - "--entrypoints.web.forwardedheaders.insecure=true"
+
+  # ---------------------------------------------------------------------------
+  # Dex — local zero-dependency OIDC IdP for validating the OIDC automatic
+  # user-association flow.
+  # ---------------------------------------------------------------------------
+  dex:
+    image: "ghcr.io/dexidp/dex:v2.41.1"
+    container_name: "headplane-dex"
+    restart: "unless-stopped"
+    # Dex image runs as uid 1001 by default; run as root so it can create
+    # sqlite db files in the bind-mounted host directory.
+    user: "0:0"
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    networks:
+      - "headplane-dev"
+    volumes:
+      - "./dex/config.yaml:/etc/dex/config.yaml:ro"
+      - "./dex-data:/var/dex"
+    environment:
+      # No secrets live in dex/config.yaml; it references these names via
+      # `secretEnv` / `hashFromEnv`. Values come from .env (see .env.example).
+      DEX_HEADPLANE_CLIENT_SECRET: "${DEX_HEADPLANE_CLIENT_SECRET:?set it in .env}"
+      DEX_HEADSCALE_CLIENT_SECRET: "${DEX_HEADSCALE_CLIENT_SECRET:?set it in .env}"
+      DEX_ALICE_PASSWORD_HASH: "${DEX_ALICE_PASSWORD_HASH:?set it in .env}"
+      DEX_BOB_PASSWORD_HASH: "${DEX_BOB_PASSWORD_HASH:?set it in .env}"
+    labels:
+      - "traefik.enable=true"
+      # Match Dex-owned paths. /admin/oidc/* is intentionally EXCLUDED
+      # because that's Headplane's callback/start, not Dex's token/authorize.
+      # The `&& !PathPrefix(\`/admin/oidc\`)` guard is critical — without it
+      # this rule steals Headplane's OIDC routes and the callback 302-loops
+      # back to /login (see Experience 468226 for the classic symptom).
+      - "traefik.http.routers.dex.rule=(PathPrefix(`/.well-known`) || PathPrefix(`/dex`) || (PathPrefix(`/oidc`) && !PathPrefix(`/admin/oidc`)))"
+      - "traefik.http.routers.dex.entrypoints=web"
+      - "traefik.http.routers.dex.priority=150"
+      - "traefik.http.services.dex.loadbalancer.server.port=5556"
+      # Dex's discovery document advertises the issuer origin exactly as we
+      # set it in config (`http://localhost:8082`). The real upstream is on
+      # port 5556 in the container, but the browser never sees that.
+
+  # ---------------------------------------------------------------------------
+  # Optional: Nginx Basic-Auth sidecar (kept around in case you want to flip
+  # back to Proxy-Auth mode later). For the OIDC PoC we route /admin directly
+  # to Headplane so the browser only has to do one auth (SSO button, no
+  # double Basic + OIDC dialogs). To re-enable, move the traefik labels from
+  # headplane back onto nginx-auth.
+  # ---------------------------------------------------------------------------
+  nginx-auth:
+    image: "nginx:1.27-alpine"
+    container_name: "headplane-nginx-auth"
+    restart: "no"
+    depends_on:
+      - "headplane"
+    networks:
+      - "headplane-dev"
+    volumes:
+      - "./traefik/nginx-auth.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./traefik/users.htpasswd:/etc/nginx/users.htpasswd:ro"
+    # traefik.enable=false for this OIDC validation run (see comment above).
+
+  # ---------------------------------------------------------------------------
+  # Headplane — panel. Exposed directly to Traefik for the OIDC run so users
+  # see the "Single Sign-On" button on /admin/login immediately.
+  # ---------------------------------------------------------------------------
+  headplane:
+    image: "ghcr.io/tale/headplane:latest"
+    container_name: "headplane"
+    restart: "unless-stopped"
+    depends_on:
+      - "headscale"
+      - "dex"
+    networks:
+      - "headplane-dev"
+    extra_hosts:
+      # Let the container resolve dex.local → host so the OIDC issuer URL
+      # works both from the browser and from inside containers.
+      - "dex.local:host-gateway"
+    volumes:
+      - "./config.yaml:/etc/headplane/config.yaml:ro"
+      - "./secrets:/run/secrets:ro"
+      - "./headplane-data:/var/lib/headplane"
+      - "./headscale:/etc/headscale"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    environment:
+      - TZ=Asia/Shanghai
+    labels:
+      - "traefik.enable=true"
+      # Headplane owns every path under /admin. This intentionally takes
+      # priority over Headscale's catch-all rule below.
+      - "traefik.http.routers.headplane.rule=PathPrefix(`/admin`)"
+      - "traefik.http.routers.headplane.entrypoints=web"
+      - "traefik.http.routers.headplane.priority=200"
+      - "traefik.http.services.headplane.loadbalancer.server.port=3000"
+      # Make sure we pass the real origin info to Headplane so cookie
+      # attributes and the generated redirect_uri match the external URL.
+      - "traefik.http.middlewares.headplane-headers.headers.customrequestheaders.X-Forwarded-Proto=http"
+      - "traefik.http.middlewares.headplane-headers.headers.customrequestheaders.X-Forwarded-Host=dex.local:8082"
+      - "traefik.http.middlewares.headplane-headers.headers.customrequestheaders.X-Forwarded-Port=8082"
+      - "traefik.http.routers.headplane.middlewares=headplane-headers@docker"
+
   headscale:
-    image: "headscale/headscale:0.29.2"
+    image: "headscale/headscale:0.29.3"
     container_name: "headscale"
     labels:
       me.tale.headplane.target: headscale
+      traefik.enable: "true"
+      # Catch-all: anything that isn't /admin (Headplane) or the Dex-owned
+      # paths handled above routes to Headscale. This way the Tailscale
+      # client's normal REST paths, Headscale's OIDC callback at /oidc/callback,
+      # and the Key/register endpoints all land here.
+      traefik.http.routers.headscale.rule: "!PathPrefix(`/admin`) && !PathPrefix(`/.well-known`) && !PathPrefix(`/dex`) && !(PathPrefix(`/oidc`) && !PathPrefix(`/admin/oidc`))"
+      traefik.http.routers.headscale.entrypoints: "web"
+      traefik.http.routers.headscale.priority: "100"
+      traefik.http.services.headscale.loadbalancer.server.port: "8080"
     restart: "unless-stopped"
     command: "serve"
     networks:
       - "headplane-dev"
+    extra_hosts:
+      # Let OIDC discovery resolve dex.local → host from inside this container.
+      - "dex.local:host-gateway"
     volumes:
       - "./.cache/headscale:/var/lib/headscale"
-      - "./test:/etc/headscale"
-    ports:
-      - "8080:8080"
-      - "9090:9090"
+      - "./headscale:/etc/headscale:ro"
+      - "./secrets:/run/secrets:ro"
     environment:
-      TZ: "America/New_York"
+      TZ: "Asia/Shanghai"

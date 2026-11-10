@@ -15,3 +15,10 @@ node_modules
 /.direnv
 /app/utils/cn-tables.ts
 /vendor
+
+# Local deployment: runtime data and credentials
+/.env
+/secrets/
+/dex-data/
+/headplane-data/
+/traefik/users.htpasswd
